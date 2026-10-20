@@ -7,11 +7,12 @@ __pycache__/
 venv/
 env/
 ENV/
+.venv/
 .venv
 
 # Streamlit
-.streamlit/
-!.streamlit/secrets.toml
+.streamlit/secrets.toml
+secrets.toml
 
 # FAISS Index
 faiss_index_storage/
