@@ -158,7 +158,3 @@ python -c "from rag_engine import load_fast_embeddings; e = load_fast_embeddings
 
 ---
 
-## 📄 License & Attribution
-
-- **License**: MIT License — see [LICENSE](LICENSE) for details.
-- **Upstream Reference**: Originally adapted from *Universal PDF RAG Chatbot* by Ratnesh Singh.
