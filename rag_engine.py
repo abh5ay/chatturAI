@@ -66,6 +66,28 @@ def compute_file_hash(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()[:16]
 
 
+_OCR_CAPABILITY: Optional[Tuple[bool, Optional[str]]] = None
+
+
+def check_ocr_availability() -> Tuple[bool, Optional[str]]:
+    """
+    Check if PyMuPDF's Tesseract OCR integration is available on the local system.
+    Cached after initial check to avoid repeated runtime overhead.
+    """
+    global _OCR_CAPABILITY
+    if _OCR_CAPABILITY is not None:
+        return _OCR_CAPABILITY
+    try:
+        dummy_doc = pymupdf.open()
+        p = dummy_doc.new_page(width=100, height=100)
+        p.get_textpage_ocr(language="eng", dpi=72)
+        dummy_doc.close()
+        _OCR_CAPABILITY = (True, None)
+    except Exception as e:
+        _OCR_CAPABILITY = (False, str(e))
+    return _OCR_CAPABILITY
+
+
 def process_single_pdf(
     file_bytes: bytes,
     filename: str,
@@ -73,7 +95,8 @@ def process_single_pdf(
     chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
 ) -> Tuple[List[Document], List[str], List[str]]:
     """
-    Extract text from a single PDF using PyMuPDF with full metadata preservation.
+    Extract text from a single PDF using PyMuPDF with smart OCR fallback for scanned/mixed pages.
+    Preserves original filenames, page numbers, document IDs, and chunk metadata.
     Returns (chunks, errors, warnings).
     """
     errors: List[str] = []
@@ -110,16 +133,71 @@ def process_single_pdf(
 
         page_documents: List[Document] = []
         total_char_count = 0
+        ocr_supported, _ = check_ocr_availability()
+        ocr_pages_count = 0
+        mixed_pages_count = 0
 
         for page_idx in range(total_pages):
             page = pdf_doc[page_idx]
-            page_text = page.get_text() or ""
-            total_char_count += len(page_text.strip())
+            native_text = page.get_text() or ""
+            stripped_native = native_text.strip()
+            num_images = len(page.get_images())
+            
+            final_text = native_text
+            method = "text"
 
-            if page_text.strip():
+            # 1. Text-based page: ample searchable text (>= 100 chars, or >= 50 chars with no images)
+            if len(stripped_native) >= 100 or (len(stripped_native) >= 50 and num_images == 0):
+                final_text = native_text
+                method = "text"
+            
+            # 2. Scanned / image-only page: missing/sparse text (< 50 chars) with image content
+            elif num_images > 0 and len(stripped_native) < 50:
+                if ocr_supported:
+                    try:
+                        tp = page.get_textpage_ocr(language="eng", dpi=150, full=True)
+                        ocr_text = page.get_text(textpage=tp) or ""
+                        if ocr_text.strip():
+                            final_text = ocr_text
+                            method = "ocr"
+                            ocr_pages_count += 1
+                        else:
+                            final_text = native_text
+                    except Exception as ocr_e:
+                        warnings.append(
+                            f"'{safe_filename}' Page {page_idx + 1}: OCR processing error: {ocr_e}"
+                        )
+                        final_text = native_text
+                else:
+                    warnings.append(
+                        f"'{safe_filename}' Page {page_idx + 1}: Scanned page detected, but local Tesseract OCR is not available."
+                    )
+                    final_text = native_text
+
+            # 3. Mixed page: sparse native text (50 <= chars < 150) alongside embedded images
+            elif num_images > 0 and len(stripped_native) < 150:
+                if ocr_supported:
+                    try:
+                        # full=False OCRs image areas only without duplicating existing searchable text
+                        tp = page.get_textpage_ocr(language="eng", dpi=150, full=False)
+                        combined_text = page.get_text(textpage=tp) or ""
+                        if len(combined_text.strip()) > len(stripped_native):
+                            final_text = combined_text
+                            method = "mixed_ocr"
+                            mixed_pages_count += 1
+                        else:
+                            final_text = native_text
+                    except Exception:
+                        final_text = native_text
+                else:
+                    final_text = native_text
+
+            total_char_count += len(final_text.strip())
+
+            if final_text.strip():
                 page_documents.append(
                     Document(
-                        page_content=page_text,
+                        page_content=final_text,
                         metadata={
                             "source": safe_filename,
                             "doc_id": doc_id,
@@ -127,13 +205,19 @@ def process_single_pdf(
                             "page": page_idx,            # 0-indexed
                             "page_number": page_idx + 1, # 1-indexed
                             "total_pages": total_pages,
+                            "extraction_method": method,
                         },
                     )
                 )
 
+        if ocr_pages_count > 0 or mixed_pages_count > 0:
+            warnings.append(
+                f"'{safe_filename}': Smart OCR extracted text from {ocr_pages_count + mixed_pages_count} scanned/mixed page(s). Note: Complex mathematical equations, nested tables, and handwritten notes have limited OCR accuracy."
+            )
+
         if total_char_count < 20:
             warnings.append(
-                f"'{safe_filename}' has no readable text. (Scanned or image-only PDFs are not supported in Stage 2)."
+                f"'{safe_filename}' has no readable text even after OCR processing."
             )
             return chunks, errors, warnings
 

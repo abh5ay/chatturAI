@@ -4,9 +4,12 @@ Implements Smart Notes, Explain Simply, MCQ Quiz Generator, and Interactive Flas
 Guarantees document grounding, strict JSON validation, and clean error handling.
 """
 
+import hashlib
 import json
+import random
 import re
-from typing import Any, Dict, List, Optional, Tuple
+import time
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
@@ -16,6 +19,120 @@ from rag_engine import (
     INSUFFICIENT_EVIDENCE_MSG,
     DEFAULT_TOP_K,
 )
+
+# ------------------------------------------------------------------------------
+# SHARED LLM REQUEST RESILIENCE & BUDGETS (PHASE 2)
+# ------------------------------------------------------------------------------
+
+TOKEN_BUDGETS: Dict[str, int] = {
+    "ai_tutor": 800,
+    "explain_simply": 750,
+    "smart_notes_short": 900,
+    "smart_notes_detailed": 1500,
+    "mcq_quiz": 1200,
+    "flashcards": 1000,
+}
+
+MAX_RETRIES = 2
+MAX_TOTAL_WAIT_SECONDS = 8.0
+
+
+def classify_llm_error(error: Exception) -> Tuple[str, bool, Optional[float]]:
+    """
+    Classify an LLM error into a user-friendly message, retryable status, and optional retry delay.
+    Returns (user_message, is_retryable, retry_after_seconds).
+    """
+    err_str = str(error).lower()
+
+    # 1. Authentication / Invalid API Key (Non-retryable)
+    if any(k in err_str for k in ["401", "authentication", "unauthorized", "invalid api key", "invalid_api_key"]):
+        return ("Invalid Groq API key. Please check your credentials in the settings.", False, None)
+
+    # 2. Rate Limiting (429) (Retryable)
+    if "429" in err_str or "rate limit" in err_str or "rate_limit_exceeded" in err_str:
+        retry_delay = None
+        match = re.search(r"try again in ([\d\.]+)\s*s", err_str)
+        if match:
+            try:
+                retry_delay = float(match.group(1))
+            except ValueError:
+                pass
+        if retry_delay is None and hasattr(error, "response") and error.response is not None:
+            headers = getattr(error.response, "headers", {})
+            if "retry-after" in headers:
+                try:
+                    retry_delay = float(headers["retry-after"])
+                except (ValueError, TypeError):
+                    pass
+        return ("Groq rate limit reached. Please wait a moment before trying again.", True, retry_delay)
+
+    # 3. Timeouts (Retryable)
+    if "timeout" in err_str or "timed out" in err_str:
+        return ("The AI request timed out. Please try asking again.", True, None)
+
+    # 4. Context Window Exceeded (Non-retryable without changing input)
+    if any(k in err_str for k in ["context_length_exceeded", "maximum context length", "too many tokens"]):
+        return ("The document passage is too large for the model's context window. Please select fewer documents.", False, None)
+
+    # 5. Transient Server Errors (5xx) (Retryable)
+    if any(k in err_str for k in ["500", "502", "503", "504", "internal server error", "service unavailable", "overloaded"]):
+        return ("The AI service is temporarily experiencing high load. Please retry in a moment.", True, None)
+
+    # 6. Default Fallback
+    return (f"AI request failed: {error}", False, None)
+
+
+def invoke_llm_resilient(
+    invokable: Any,
+    payload: Dict[str, Any],
+    feature_name: str,
+    max_retries: int = MAX_RETRIES,
+    sleep_fn: Callable[[float], None] = time.sleep,
+) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Execute an LLM chain or model with centralized error handling, exponential backoff,
+    and Retry-After compliance.
+    Returns (raw_text_output, error_message).
+    """
+    total_waited = 0.0
+
+    for attempt in range(max_retries + 1):
+        try:
+            res = invokable.invoke(payload)
+            text = res.content if hasattr(res, "content") else str(res)
+            return text, None
+        except Exception as e:
+            user_msg, is_retryable, retry_after = classify_llm_error(e)
+
+            if not is_retryable or attempt >= max_retries:
+                return None, user_msg
+
+            if retry_after is not None:
+                delay = retry_after
+            else:
+                delay = min(1.0 * (2 ** attempt) + random.uniform(0.1, 0.4), 4.0)
+
+            if total_waited + delay > MAX_TOTAL_WAIT_SECONDS:
+                return None, f"Groq is busy. Please try again in {int(delay + 1)} seconds."
+
+            sleep_fn(delay)
+            total_waited += delay
+
+    return None, "Unable to complete request after retries."
+
+
+def compute_study_cache_key(
+    feature: str,
+    doc_fingerprints: List[str],
+    query_or_config: str,
+    model_name: str = "qwen/qwen3.8-27b",
+    version: str = "v2",
+) -> str:
+    """Generate a deterministic hash key for session-scoped response reuse."""
+    fingerprint_str = ",".join(sorted(doc_fingerprints))
+    combined = f"{feature}:{fingerprint_str}:{query_or_config}:{model_name}:{version}"
+    return hashlib.sha256(combined.encode("utf-8")).hexdigest()[:24]
+
 
 # ------------------------------------------------------------------------------
 # 1. SMART NOTES
@@ -102,24 +219,28 @@ def generate_smart_notes(
     prompt = ChatPromptTemplate.from_template(SMART_NOTES_PROMPT)
     chain = prompt | llm
 
-    try:
-        response = chain.invoke({
+    raw_text, err = invoke_llm_resilient(
+        chain,
+        {
             "length_instruction": length_inst,
             "context": context_text,
-        })
-        notes_text = response.content if hasattr(response, "content") else str(response)
-        citations = format_citations_metadata(sample_chunks)
-        return {
-            "notes": notes_text,
-            "citations": citations,
-            "error": None
-        }
-    except Exception as e:
+        },
+        feature_name=f"smart_notes_{length.lower()}"
+    )
+
+    if err:
         return {
             "notes": "",
             "citations": [],
-            "error": f"Failed to generate Smart Notes: {e}"
+            "error": err
         }
+
+    citations = format_citations_metadata(sample_chunks)
+    return {
+        "notes": raw_text,
+        "citations": citations,
+        "error": None
+    }
 
 
 # ------------------------------------------------------------------------------
@@ -188,21 +309,25 @@ def explain_simply(
     )
     chain = prompt | llm
 
-    try:
-        response = chain.invoke({"context": context_text, "concept": concept})
-        ans = response.content if hasattr(response, "content") else str(response)
-        citations = format_citations_metadata(retrieved)
-        return {
-            "explanation": ans,
-            "citations": citations,
-            "error": None
-        }
-    except Exception as e:
+    raw_text, err = invoke_llm_resilient(
+        chain,
+        {"context": context_text, "concept": concept},
+        feature_name="explain_simply"
+    )
+
+    if err:
         return {
             "explanation": "",
             "citations": [],
-            "error": f"Explain Simply failed: {e}"
+            "error": err
         }
+
+    citations = format_citations_metadata(retrieved)
+    return {
+        "explanation": raw_text,
+        "citations": citations,
+        "error": None
+    }
 
 
 # ------------------------------------------------------------------------------
@@ -325,10 +450,15 @@ def generate_mcq_quiz(
     prompt = ChatPromptTemplate.from_template(QUIZ_PROMPT)
     chain = prompt | llm
 
-    for attempt in range(2):  # Max 1 retry
+    for attempt in range(2):  # Max 1 retry on malformed JSON
+        raw_text, err = invoke_llm_resilient(
+            chain,
+            {"context": context_text},
+            feature_name="mcq_quiz"
+        )
+        if err:
+            return {"quiz": [], "error": err}
         try:
-            res = chain.invoke({"context": context_text})
-            raw_text = res.content if hasattr(res, "content") else str(res)
             parsed = extract_json_from_response(raw_text)
             valid, questions, err_msg = validate_quiz_structure(parsed)
             if valid:
@@ -423,9 +553,15 @@ def generate_flashcards(
     prompt = ChatPromptTemplate.from_template(FLASHCARD_PROMPT)
     chain = prompt | llm
 
+    raw_text, err = invoke_llm_resilient(
+        chain,
+        {"context": context_text},
+        feature_name="flashcards"
+    )
+    if err:
+        return {"flashcards": [], "error": err}
+
     try:
-        res = chain.invoke({"context": context_text})
-        raw_text = res.content if hasattr(res, "content") else str(res)
         parsed = extract_json_from_response(raw_text)
         valid, cards, err_msg = validate_flashcards(parsed)
         if valid:

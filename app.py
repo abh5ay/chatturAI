@@ -35,7 +35,11 @@ from study_tools import (
     explain_simply,
     generate_mcq_quiz,
     generate_flashcards,
+    invoke_llm_resilient,
+    TOKEN_BUDGETS,
+    compute_study_cache_key,
 )
+from workspace_manager import WorkspaceManager
 
 # LangChain & Vectorstore components
 from langchain_community.vectorstores import FAISS
@@ -243,15 +247,19 @@ def get_groq_llm_instance(api_key: str, model_name: str, max_tokens: int = 1000)
         max_tokens=max_tokens
     )
 
-def get_default_study_llm():
-    """Retrieve configured ChatGroq instance for study features."""
+def get_default_study_llm(max_tokens: int = 1000):
+    """Retrieve configured ChatGroq instance for study features with token budget."""
     groq_key = os.environ.get("GROQ_API_KEY") or (st.secrets.get("GROQ_API_KEY", "") if hasattr(st, "secrets") else "")
     if GROQ_AVAILABLE and groq_key:
-        return get_groq_llm_instance(groq_key, "qwen/qwen3.8-27b")
+        return get_groq_llm_instance(groq_key, "qwen/qwen3.8-27b", max_tokens=max_tokens)
     openai_key = os.environ.get("OPENAI_API_KEY") or (st.secrets.get("OPENAI_API_KEY", "") if hasattr(st, "secrets") else "")
     if OPENAI_AVAILABLE and openai_key:
         return OpenAI(temperature=0.0, openai_api_key=openai_key)
     return None
+
+# Session State Initialization
+if "feature_cache" not in st.session_state:
+    st.session_state["feature_cache"] = {}
 
 # Session State Initialization
 if "messages" not in st.session_state:
@@ -295,6 +303,51 @@ if "flashcard_idx" not in st.session_state:
 if "flashcard_show_back" not in st.session_state:
     st.session_state["flashcard_show_back"] = False
 
+# ------------------------------------------------------------------------------
+# PHASE 3: PERSISTENT STUDY WORKSPACE INITIALIZATION
+# ------------------------------------------------------------------------------
+ws_manager = WorkspaceManager()
+all_workspaces = ws_manager.list_workspaces()
+if not all_workspaces:
+    default_ws = ws_manager.create_workspace("Default Workspace")
+    all_workspaces = [default_ws]
+
+if "active_workspace_id" not in st.session_state:
+    st.session_state["active_workspace_id"] = all_workspaces[0]["id"]
+    loaded_init = ws_manager.load_workspace_state(st.session_state["active_workspace_id"], get_embeddings())
+    if loaded_init:
+        for k, v in loaded_init.items():
+            if k not in ["id", "name"]:
+                st.session_state[k] = v
+
+
+def sync_current_workspace(files_data=None):
+    ws_id = st.session_state.get("active_workspace_id")
+    if ws_id:
+        try:
+            ws_manager.save_workspace_state(
+                workspace_id=ws_id,
+                uploaded_file_info=st.session_state.get("uploaded_file_info", []),
+                document_chunks=st.session_state.get("document_chunks", []),
+                vector_db=st.session_state.get("vector_db"),
+                messages=st.session_state.get("messages", []),
+                smart_notes=st.session_state.get("smart_notes"),
+                explain_result=st.session_state.get("explain_result"),
+                current_quiz=st.session_state.get("current_quiz"),
+                quiz_state={
+                    "quiz_answers": st.session_state.get("quiz_answers", {}),
+                    "quiz_submitted": st.session_state.get("quiz_submitted", False),
+                    "quiz_score": st.session_state.get("quiz_score"),
+                },
+                flashcards=st.session_state.get("flashcards"),
+                flashcard_idx=st.session_state.get("flashcard_idx", 0),
+                feature_cache=st.session_state.get("feature_cache", {}),
+                files_data=files_data,
+            )
+        except Exception as e:
+            log_event(f"Workspace sync error: {e}", "WARNING")
+
+
 # Sidebar Navigation & System Status
 with st.sidebar:
     st.markdown("""
@@ -304,6 +357,85 @@ with st.sidebar:
         <p style='margin: 0; font-size: 0.8rem; color: #a78bfa; font-weight: 600;'>Ratta Nahi, Samajh Ke Padho!</p>
     </div>
     """, unsafe_allow_html=True)
+    st.markdown("---")
+
+    # Workspace Selection & Management (Phase 3)
+    st.markdown("#### 🗂️ Study Workspace")
+    ws_id_to_name = {w["id"]: w["name"] for w in all_workspaces}
+    ws_ids = [w["id"] for w in all_workspaces]
+    current_ws_id = st.session_state.get("active_workspace_id", ws_ids[0])
+    current_ws_idx = ws_ids.index(current_ws_id) if current_ws_id in ws_ids else 0
+
+    selected_ws_id = st.selectbox(
+        "Active Workspace",
+        options=ws_ids,
+        format_func=lambda wid: f"{ws_id_to_name.get(wid, wid)}",
+        index=current_ws_idx,
+        key="active_workspace_select",
+        label_visibility="collapsed"
+    )
+
+    if selected_ws_id != st.session_state.get("active_workspace_id"):
+        sync_current_workspace()
+        st.session_state["active_workspace_id"] = selected_ws_id
+        st.session_state["vector_db"] = None
+        st.session_state["uploaded_file_info"] = []
+        st.session_state["processed_file_keys"] = []
+        st.session_state["total_chunks"] = 0
+        st.session_state["document_chunks"] = []
+        st.session_state["feature_cache"] = {}
+        st.session_state["smart_notes"] = None
+        st.session_state["explain_result"] = None
+        st.session_state["current_quiz"] = None
+        st.session_state["flashcards"] = None
+        st.session_state["messages"] = []
+        loaded = ws_manager.load_workspace_state(selected_ws_id, get_embeddings())
+        if loaded:
+            for k, v in loaded.items():
+                if k not in ["id", "name"]:
+                    st.session_state[k] = v
+        log_event(f"Switched to workspace: {ws_id_to_name.get(selected_ws_id)}")
+        st.rerun()
+
+    with st.expander("⚙️ Manage Workspaces", expanded=False):
+        new_ws_name = st.text_input("New workspace name:", placeholder="e.g. Operating Systems", key="new_ws_input")
+        if st.button("➕ Create Workspace", use_container_width=True, disabled=not new_ws_name.strip()):
+            created = ws_manager.create_workspace(new_ws_name.strip())
+            st.session_state["active_workspace_id"] = created["id"]
+            st.session_state["vector_db"] = None
+            st.session_state["uploaded_file_info"] = []
+            st.session_state["processed_file_keys"] = []
+            st.session_state["total_chunks"] = 0
+            st.session_state["document_chunks"] = []
+            st.session_state["feature_cache"] = {}
+            st.session_state["smart_notes"] = None
+            st.session_state["explain_result"] = None
+            st.session_state["current_quiz"] = None
+            st.session_state["flashcards"] = None
+            st.session_state["messages"] = []
+            st.success(f"Created '{created['name']}'!")
+            st.rerun()
+
+        rename_name = st.text_input("Rename current workspace:", value=ws_id_to_name.get(selected_ws_id, ""), key="rename_ws_input")
+        if st.button("✏️ Rename Workspace", use_container_width=True, disabled=not rename_name.strip()):
+            if ws_manager.rename_workspace(selected_ws_id, rename_name.strip()):
+                st.success("Workspace renamed!")
+                st.rerun()
+
+        if len(all_workspaces) > 1:
+            confirm_del = st.checkbox("Confirm deletion of this workspace", key="confirm_del_ws")
+            if st.button("🗑️ Delete Workspace", use_container_width=True, disabled=not confirm_del):
+                ws_manager.delete_workspace(selected_ws_id)
+                remaining = ws_manager.list_workspaces()
+                st.session_state["active_workspace_id"] = remaining[0]["id"]
+                loaded = ws_manager.load_workspace_state(remaining[0]["id"], get_embeddings())
+                if loaded:
+                    for k, v in loaded.items():
+                        if k not in ["id", "name"]:
+                            st.session_state[k] = v
+                st.success("Workspace deleted.")
+                st.rerun()
+
     st.markdown("---")
     
     # Navigation Radio
@@ -507,7 +639,8 @@ elif st.session_state["nav_section"] == "📁 My Documents":
                         st.session_state["total_chunks"] = len(ingest_result.documents)
                         st.session_state["document_chunks"] = ingest_result.documents
                         
-                        # Invalidate stale study state on new ingestion
+                        # Invalidate stale study state and response cache on new ingestion
+                        st.session_state["feature_cache"] = {}
                         st.session_state["smart_notes"] = None
                         st.session_state["notes_doc_key"] = None
                         st.session_state["explain_result"] = None
@@ -523,13 +656,17 @@ elif st.session_state["nav_section"] == "📁 My Documents":
                         
                         # Record document metadata
                         file_info_list = []
+                        files_bytes_dict = {}
                         for f in uploaded_files:
+                            b = f.getvalue()
+                            files_bytes_dict[f.name] = b
                             file_info_list.append({
                                 "name": f.name,
-                                "size_kb": round(len(f.getvalue()) / 1024, 1),
+                                "size_kb": round(len(b) / 1024, 1),
                                 "status": "Indexed & Ready ✅"
                             })
                         st.session_state["uploaded_file_info"] = file_info_list
+                        sync_current_workspace(files_data=files_bytes_dict)
                         st.success(f"✅ Successfully indexed {len(ingest_result.documents)} passages from {len(ingest_result.processed_files)} document(s)!")
                         log_event(f"Indexed {len(ingest_result.documents)} chunks across {len(ingest_result.processed_files)} document(s)")
                     else:
@@ -543,6 +680,7 @@ elif st.session_state["nav_section"] == "📁 My Documents":
                 st.session_state["processed_file_keys"] = []
                 st.session_state["total_chunks"] = 0
                 st.session_state["document_chunks"] = []
+                st.session_state["feature_cache"] = {}
                 st.session_state["smart_notes"] = None
                 st.session_state["notes_doc_key"] = None
                 st.session_state["explain_result"] = None
@@ -555,6 +693,7 @@ elif st.session_state["nav_section"] == "📁 My Documents":
                 st.session_state["flashcards_doc_key"] = None
                 st.session_state["flashcard_idx"] = 0
                 st.session_state["flashcard_show_back"] = False
+                sync_current_workspace()
                 st.success("All documents cleared and vector store invalidated.")
                 log_event("Documents cleared by user.")
                 st.rerun()
@@ -688,17 +827,47 @@ elif st.session_state["nav_section"] == "🎓 AI Tutor":
                             "citations": []
                         })
                     else:
-                        answered = False
-                        for model_name, provider in models_to_try:
-                            try:
+                        doc_hashes = [c.metadata.get("doc_hash", "") for c in source_docs]
+                        cache_key = compute_study_cache_key("ai_tutor", doc_hashes, user_query)
+                        cached_resp = st.session_state.get("feature_cache", {}).get(cache_key)
+
+                        if cached_resp:
+                            answer_text = cached_resp["answer"]
+                            citations = cached_resp.get("citations", citations)
+                            st.markdown(answer_text)
+                            if citations:
+                                with st.expander(f"📚 Sources ({len(citations)} references)", expanded=True):
+                                    for cit in citations:
+                                        st.markdown(f"**📄 {cit['source']}** — *Page {cit['page_number']}*")
+                                        st.caption(f"> {cit['snippet']}")
+                                        st.markdown("---")
+                            st.caption(f"🤖 Powered by `{cached_resp.get('model', 'qwen/qwen3.8-27b')}` *(session cache)*")
+                            st.session_state["messages"].append({
+                                "role": "assistant",
+                                "content": answer_text,
+                                "citations": citations,
+                                "model": f"{cached_resp.get('model', 'qwen/qwen3.8-27b')} (cached)"
+                            })
+                            sync_current_workspace()
+                            log_event("Reused session-cached AI Tutor response")
+                        else:
+                            answered = False
+                            for model_name, provider in models_to_try:
                                 if provider == "groq":
-                                    llm = get_groq_llm_instance(groq_key, model_name)
+                                    llm = get_groq_llm_instance(groq_key, model_name, max_tokens=TOKEN_BUDGETS["ai_tutor"])
                                 else:
                                     llm = OpenAI(temperature=0.0, openai_api_key=openai_key)
                                     
                                 doc_chain = create_stuff_documents_chain(llm, prompt)
-                                response = doc_chain.invoke({"context": source_docs, "input": user_query})
-                                answer_text = response if isinstance(response, str) else str(response)
+                                answer_text, err_msg = invoke_llm_resilient(
+                                    doc_chain,
+                                    {"context": source_docs, "input": user_query},
+                                    feature_name="ai_tutor"
+                                )
+                                
+                                if err_msg:
+                                    log_event(f"Model {model_name} failed: {err_msg}", "WARNING")
+                                    continue
                                 
                                 st.markdown(answer_text)
                                 if citations:
@@ -715,20 +884,24 @@ elif st.session_state["nav_section"] == "🎓 AI Tutor":
                                     "citations": citations,
                                     "model": model_name
                                 })
+                                st.session_state["feature_cache"][cache_key] = {
+                                    "answer": answer_text,
+                                    "citations": citations,
+                                    "model": model_name
+                                }
+                                sync_current_workspace()
                                 log_event(f"Generated grounded answer with {model_name}")
                                 answered = True
                                 break
-                            except Exception as e:
-                                log_event(f"Model {model_name} failed: {e}", "WARNING")
-                                continue
-                                
-                        if not answered:
-                            st.error("❌ Unable to generate response with available models. Please try again.")
-                            st.session_state["messages"].append({
-                                "role": "assistant",
-                                "content": "❌ Unable to generate response. Please check your API key and connection.",
-                                "citations": []
-                            })
+                                    
+                            if not answered:
+                                st.error("❌ Unable to generate response with available models. Please try again.")
+                                st.session_state["messages"].append({
+                                    "role": "assistant",
+                                    "content": "❌ Unable to generate response. Please check your API key and connection.",
+                                    "citations": []
+                                })
+                                sync_current_workspace()
                             
     # Chat Actions Toolbar
     if st.session_state.get("messages"):
@@ -737,6 +910,7 @@ elif st.session_state["nav_section"] == "🎓 AI Tutor":
         with col_c1:
             if st.button("🗑️ Clear Chat History", use_container_width=True):
                 st.session_state["messages"] = []
+                sync_current_workspace()
                 st.rerun()
         with col_c2:
             chat_export = f"chatturAI Study Session Export — {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
@@ -794,7 +968,8 @@ elif st.session_state["nav_section"] == "📝 Smart Notes":
             st.session_state["notes_doc_key"] = current_notes_key
 
         if st.button("📝 Generate Smart Notes", use_container_width=True, disabled=not selected_docs):
-            llm = get_default_study_llm()
+            budget = TOKEN_BUDGETS["smart_notes_detailed"] if summary_length == "Detailed" else TOKEN_BUDGETS["smart_notes_short"]
+            llm = get_default_study_llm(max_tokens=budget)
             if not llm:
                 st.error("❌ No LLM configured. Please provide GROQ_API_KEY in your .env file.")
             else:
@@ -814,14 +989,26 @@ elif st.session_state["nav_section"] == "📝 Smart Notes":
                 if not filtered_chunks:
                     st.error("❌ No document passages found for the selected scope.")
                 else:
-                    with st.spinner("🧠 Synthesizing structured study notes from your documents..."):
-                        res = generate_smart_notes(filtered_chunks, summary_length, llm)
-                        if res.get("error"):
-                            st.error(f"❌ {res['error']}")
-                        else:
-                            st.session_state["smart_notes"] = res
-                            log_event(f"Generated {summary_length} Smart Notes across {len(selected_docs)} document(s)")
-                            st.rerun()
+                    doc_fingerprints = [c.metadata.get("doc_hash", "") for c in filtered_chunks]
+                    cache_key = compute_study_cache_key("smart_notes", doc_fingerprints, summary_length)
+                    cached_notes = st.session_state.get("feature_cache", {}).get(cache_key)
+
+                    if cached_notes and not cached_notes.get("error"):
+                        st.session_state["smart_notes"] = cached_notes
+                        sync_current_workspace()
+                        log_event(f"Reused session-cached {summary_length} Smart Notes")
+                        st.rerun()
+                    else:
+                        with st.spinner("🧠 Synthesizing structured study notes from your documents..."):
+                            res = generate_smart_notes(filtered_chunks, summary_length, llm)
+                            if res.get("error"):
+                                st.error(f"❌ {res['error']}")
+                            else:
+                                st.session_state["smart_notes"] = res
+                                st.session_state["feature_cache"][cache_key] = res
+                                sync_current_workspace()
+                                log_event(f"Generated {summary_length} Smart Notes across {len(selected_docs)} document(s)")
+                                st.rerun()
 
         # Display Generated Smart Notes
         if st.session_state.get("smart_notes"):
@@ -859,15 +1046,28 @@ elif st.session_state["nav_section"] == "📝 Smart Notes":
             explain_btn = st.button("✨ Explain Concept", use_container_width=True, disabled=not concept_input.strip())
             
         if explain_btn and concept_input.strip():
-            llm = get_default_study_llm()
+            llm = get_default_study_llm(max_tokens=TOKEN_BUDGETS["explain_simply"])
             if not llm:
                 st.error("❌ No LLM configured. Please check GROQ_API_KEY in .env.")
             else:
-                with st.spinner(f"🔍 Breaking down '{concept_input}' simply..."):
-                    res = explain_simply(concept_input, st.session_state.get("vector_db"), llm)
-                    st.session_state["explain_result"] = res
-                    log_event(f"Generated Explain Simply for: {concept_input}")
+                doc_fingerprints = [c.metadata.get("doc_hash", "") for c in st.session_state.get("document_chunks", [])]
+                cache_key = compute_study_cache_key("explain_simply", doc_fingerprints, concept_input.strip())
+                cached_res = st.session_state.get("feature_cache", {}).get(cache_key)
+
+                if cached_res and not cached_res.get("error"):
+                    st.session_state["explain_result"] = cached_res
+                    sync_current_workspace()
+                    log_event(f"Reused session-cached Explain Simply for: {concept_input}")
                     st.rerun()
+                else:
+                    with st.spinner(f"🔍 Breaking down '{concept_input}' simply..."):
+                        res = explain_simply(concept_input, st.session_state.get("vector_db"), llm)
+                        if not res.get("error"):
+                            st.session_state["feature_cache"][cache_key] = res
+                        st.session_state["explain_result"] = res
+                        sync_current_workspace()
+                        log_event(f"Generated Explain Simply for: {concept_input}")
+                        st.rerun()
 
         if st.session_state.get("explain_result"):
             ex_res = st.session_state["explain_result"]
@@ -932,7 +1132,7 @@ elif st.session_state["nav_section"] == "⚡ Practice":
                 gen_quiz_btn = st.button("🎲 Generate 5-Question Quiz", use_container_width=True, disabled=not quiz_scope)
                 
             if gen_quiz_btn and quiz_scope:
-                llm = get_default_study_llm()
+                llm = get_default_study_llm(max_tokens=TOKEN_BUDGETS["mcq_quiz"])
                 if not llm:
                     st.error("❌ No LLM configured. Please check GROQ_API_KEY in .env.")
                 else:
@@ -951,17 +1151,32 @@ elif st.session_state["nav_section"] == "⚡ Practice":
                     if not filtered_chunks:
                         st.error("❌ No passages available for the selected scope.")
                     else:
-                        with st.spinner("🎲 Crafting 5 challenging MCQs with strict grounding..."):
-                            res = generate_mcq_quiz(filtered_chunks, llm)
-                            if res.get("error"):
-                                st.error(f"❌ {res['error']}")
-                            else:
-                                st.session_state["current_quiz"] = res["quiz"]
-                                st.session_state["quiz_answers"] = {}
-                                st.session_state["quiz_submitted"] = False
-                                st.session_state["quiz_score"] = None
-                                log_event(f"Generated 5-question quiz across {len(quiz_scope)} document(s)")
-                                st.rerun()
+                        doc_fingerprints = [c.metadata.get("doc_hash", "") for c in filtered_chunks]
+                        cache_key = compute_study_cache_key("mcq_quiz", doc_fingerprints, "mcq_5")
+                        cached_quiz = st.session_state.get("feature_cache", {}).get(cache_key)
+
+                        if cached_quiz and len(cached_quiz) == 5:
+                            st.session_state["current_quiz"] = cached_quiz
+                            st.session_state["quiz_answers"] = {}
+                            st.session_state["quiz_submitted"] = False
+                            st.session_state["quiz_score"] = None
+                            sync_current_workspace()
+                            log_event(f"Reused session-cached 5-question quiz across {len(quiz_scope)} document(s)")
+                            st.rerun()
+                        else:
+                            with st.spinner("🎲 Crafting 5 challenging MCQs with strict grounding..."):
+                                res = generate_mcq_quiz(filtered_chunks, llm)
+                                if res.get("error"):
+                                    st.error(f"❌ {res['error']}")
+                                else:
+                                    st.session_state["current_quiz"] = res["quiz"]
+                                    st.session_state["feature_cache"][cache_key] = res["quiz"]
+                                    st.session_state["quiz_answers"] = {}
+                                    st.session_state["quiz_submitted"] = False
+                                    st.session_state["quiz_score"] = None
+                                    sync_current_workspace()
+                                    log_event(f"Generated 5-question quiz across {len(quiz_scope)} document(s)")
+                                    st.rerun()
 
             # Render Quiz Questions
             current_quiz = st.session_state.get("current_quiz")
@@ -1033,6 +1248,7 @@ elif st.session_state["nav_section"] == "⚡ Practice":
                             )
                             st.session_state["quiz_submitted"] = True
                             st.session_state["quiz_score"] = local_score
+                            sync_current_workspace()
                             log_event(f"Quiz submitted. Score: {local_score}/{len(current_quiz)}")
                             st.rerun()
                 else:
@@ -1042,6 +1258,7 @@ elif st.session_state["nav_section"] == "⚡ Practice":
                             st.session_state["quiz_answers"] = {}
                             st.session_state["quiz_submitted"] = False
                             st.session_state["quiz_score"] = None
+                            sync_current_workspace()
                             st.rerun()
 
         # ----------------------------------------------------------------------
@@ -1067,7 +1284,7 @@ elif st.session_state["nav_section"] == "⚡ Practice":
                 st.session_state["flashcard_show_back"] = False
                 
             if st.button("🎴 Generate Flashcard Deck", use_container_width=True, disabled=not fc_scope):
-                llm = get_default_study_llm()
+                llm = get_default_study_llm(max_tokens=TOKEN_BUDGETS["flashcards"])
                 if not llm:
                     st.error("❌ No LLM configured. Please check GROQ_API_KEY in .env.")
                 else:
@@ -1086,16 +1303,30 @@ elif st.session_state["nav_section"] == "⚡ Practice":
                     if not filtered_chunks:
                         st.error("❌ No passages available for the selected scope.")
                     else:
-                        with st.spinner("🎴 Generating high-yield revision flashcards..."):
-                            res = generate_flashcards(filtered_chunks, llm)
-                            if res.get("error"):
-                                st.error(f"❌ {res['error']}")
-                            else:
-                                st.session_state["flashcards"] = res["flashcards"]
-                                st.session_state["flashcard_idx"] = 0
-                                st.session_state["flashcard_show_back"] = False
-                                log_event(f"Generated {len(res['flashcards'])} flashcards across {len(fc_scope)} document(s)")
-                                st.rerun()
+                        doc_fingerprints = [c.metadata.get("doc_hash", "") for c in filtered_chunks]
+                        cache_key = compute_study_cache_key("flashcards", doc_fingerprints, "flashcards_10")
+                        cached_cards = st.session_state.get("feature_cache", {}).get(cache_key)
+
+                        if cached_cards and len(cached_cards) > 0:
+                            st.session_state["flashcards"] = cached_cards
+                            st.session_state["flashcard_idx"] = 0
+                            st.session_state["flashcard_show_back"] = False
+                            sync_current_workspace()
+                            log_event(f"Reused session-cached {len(cached_cards)} flashcards across {len(fc_scope)} document(s)")
+                            st.rerun()
+                        else:
+                            with st.spinner("🎴 Generating high-yield revision flashcards..."):
+                                res = generate_flashcards(filtered_chunks, llm)
+                                if res.get("error"):
+                                    st.error(f"❌ {res['error']}")
+                                else:
+                                    st.session_state["flashcards"] = res["flashcards"]
+                                    st.session_state["feature_cache"][cache_key] = res["flashcards"]
+                                    st.session_state["flashcard_idx"] = 0
+                                    st.session_state["flashcard_show_back"] = False
+                                    sync_current_workspace()
+                                    log_event(f"Generated {len(res['flashcards'])} flashcards across {len(fc_scope)} document(s)")
+                                    st.rerun()
 
             # Render Flashcard Viewer
             flashcards = st.session_state.get("flashcards")
@@ -1141,15 +1372,18 @@ elif st.session_state["nav_section"] == "⚡ Practice":
                     if st.button("⬅️ Previous", use_container_width=True, disabled=cur_idx <= 0):
                         st.session_state["flashcard_idx"] = max(0, cur_idx - 1)
                         st.session_state["flashcard_show_back"] = False
+                        sync_current_workspace()
                         st.rerun()
                 with col_c_flip:
                     toggle_text = "🙈 Hide Answer" if show_back else "👁️ Reveal Answer"
                     if st.button(toggle_text, use_container_width=True):
                         st.session_state["flashcard_show_back"] = not show_back
+                        sync_current_workspace()
                         st.rerun()
                 with col_c_next:
                     if st.button("Next ➡️", use_container_width=True, disabled=cur_idx >= len(flashcards) - 1):
                         st.session_state["flashcard_idx"] = min(len(flashcards) - 1, cur_idx + 1)
                         st.session_state["flashcard_show_back"] = False
+                        sync_current_workspace()
                         st.rerun()
 

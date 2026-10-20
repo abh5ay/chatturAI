@@ -1,48 +1,66 @@
-# Python
+# Python & Bytecode
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
+
+# Virtual Environments
 venv/
 env/
 ENV/
 .venv/
 .venv
 
-# Streamlit
+# Streamlit & Credentials
 .streamlit/secrets.toml
+.streamlit/credentials.toml
 secrets.toml
+credentials.toml
+*.credentials
 
-# FAISS Index
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# FAISS & Workspace Storage
 faiss_index_storage/
+workspaces_storage/
 *.index
+*.faiss
 *.pkl
 
-# Temporary files
+# SQLite Databases & WAL/SHM Journals
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+
+# Temporary & Cache files
 *.tmp
 *.temp
 temp_*/
+Library/
 
-# IDE
+# IDE & Editor files
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
 
-# OS
+# Operating System
 .DS_Store
 Thumbs.db
 
 # Logs
 *.log
 
-# Environment variables
-.env
-.env.local
-
-# Test and debug files
+# Test & Debug scratch scripts
 test_*.py
 debug_*.py
 *_test.py
@@ -52,6 +70,7 @@ temp_loader.py
 app_auto_load.py
 yulu_app.py
 
-# Sample PDFs (too large for git)
+# Private PDFs & User Documents
 *.pdf
 !docs/*.pdf
+!examples/*.pdf
